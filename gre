@@ -1,0 +1,402 @@
+# %% [markdown]
+# Opera Cloud schema export for Maulik
+# Field list = RA Models.xlsx (TablesAndFields sheet, 224 fields)
+#            + ALLOTMENT_HEADER and STAY_RECORDS pulled from the OperaCloud DW.
+# Adds SQL data types from the DW, a check that each field exists in the DW,
+# and table/field descriptions. Run cell by cell; review before exporting.
+
+# %% Cell 1 - Config and connection
+import pandas as pd
+from sqlalchemy import create_engine
+from urllib.parse import quote_plus
+
+EXCEL_PATH = r"RA Models.xlsx"          # <- full path if not in the notebook folder
+SHEET_NAME = "TablesAndFields"
+
+SERVER = "DWDatabase"                   # <- confirm server name
+DATABASE = "OperaCloud"
+DRIVER = "ODBC Driver 17 for SQL Server"
+
+ADDITIONAL_TABLES = ["ALLOTMENT_HEADER", "STAY_RECORDS"]
+
+# Excel names that differ from the DW table/column names
+TABLE_NAME_MAP = {"AR$_ACCOUNT": "AR_ACCOUNT"}
+FIELD_NAME_MAP = {"ID (used to be ROWID)": "ID"}
+
+# Also list DW columns that are not in the Excel model (for the in-scope tables)?
+INCLUDE_DW_ONLY_COLUMNS = False
+
+conn_str = (
+    f"DRIVER={{{DRIVER}}};SERVER={SERVER};DATABASE={DATABASE};"
+    "Trusted_Connection=yes;TrustServerCertificate=yes;"
+)
+engine = create_engine(f"mssql+pyodbc:///?odbc_connect={quote_plus(conn_str)}")
+print("Configured:", SERVER, "/", DATABASE)
+
+# %% Cell 2 - Read the Excel field list
+xl = pd.read_excel(EXCEL_PATH, sheet_name=SHEET_NAME, usecols="A:D", dtype=str)
+xl.columns = ["ExcelTableName", "ExcelFieldName", "PK", "InExport"]
+xl = xl.dropna(subset=["ExcelTableName", "ExcelFieldName"])
+xl = xl.apply(lambda s: s.str.strip())
+xl[["PK", "InExport"]] = xl[["PK", "InExport"]].fillna("")
+
+xl["TableName"] = xl["ExcelTableName"].replace(TABLE_NAME_MAP)
+xl["FieldName"] = xl["ExcelFieldName"].replace(FIELD_NAME_MAP)
+xl["Source"] = "RA Models.xlsx"
+xl["ExcelOrder"] = range(len(xl))
+
+print(len(xl), "fields from Excel (expected 224)")
+xl.groupby("TableName").size()
+
+# %% Cell 3 - DW columns and data types
+schema_sql = """
+SELECT
+    c.TABLE_NAME               AS TableName,
+    c.COLUMN_NAME              AS FieldName,
+    c.ORDINAL_POSITION         AS DWOrder,
+    c.DATA_TYPE                AS DataType,
+    c.CHARACTER_MAXIMUM_LENGTH AS MaxLength,
+    c.NUMERIC_PRECISION        AS NumericPrecision,
+    c.NUMERIC_SCALE            AS NumericScale,
+    c.IS_NULLABLE              AS IsNullable
+FROM INFORMATION_SCHEMA.COLUMNS c
+JOIN INFORMATION_SCHEMA.TABLES t
+  ON t.TABLE_SCHEMA = c.TABLE_SCHEMA
+ AND t.TABLE_NAME   = c.TABLE_NAME
+ AND t.TABLE_TYPE   = 'BASE TABLE'
+WHERE c.TABLE_SCHEMA = 'dbo';
+"""
+dw = pd.read_sql(schema_sql, engine)
+
+
+def format_type(row):
+    dt = row["DataType"]
+    if dt in ("varchar", "nvarchar", "char", "nchar", "varbinary", "binary"):
+        n = row["MaxLength"]
+        if pd.isna(n):
+            return dt
+        return f"{dt}(max)" if int(n) == -1 else f"{dt}({int(n)})"
+    if dt in ("decimal", "numeric"):
+        return f"{dt}({int(row['NumericPrecision'])},{int(row['NumericScale'])})"
+    return dt
+
+
+dw["SQLDataType"] = dw.apply(format_type, axis=1)
+dw["TableKey"] = dw["TableName"].str.upper()
+dw["FieldKey"] = dw["FieldName"].str.upper()
+print(len(dw), "DW columns across", dw["TableName"].nunique(), "tables")
+
+# %% Cell 4 - Add ALLOTMENT_HEADER and STAY_RECORDS from the DW
+extra = dw[dw["TableKey"].isin([t.upper() for t in ADDITIONAL_TABLES])].copy()
+extra = extra.sort_values(["TableName", "DWOrder"])
+extra["TableName"] = extra["TableKey"]
+extra["PK"] = extra["FieldKey"].eq("PKID").map({True: "Y", False: ""})
+extra["InExport"] = "Y"
+extra["Source"] = "OperaCloud DW"
+extra["ExcelOrder"] = range(len(xl), len(xl) + len(extra))
+extra = extra[["TableName", "FieldName", "PK", "InExport", "Source", "ExcelOrder"]]
+
+print(extra.groupby("TableName").size())   # expect ALLOTMENT_HEADER 17, STAY_RECORDS 27
+
+fields = pd.concat(
+    [xl[["TableName", "FieldName", "PK", "InExport", "Source", "ExcelOrder"]], extra],
+    ignore_index=True,
+)
+
+# Optional: DW columns of in-scope tables that the Excel model doesn't list
+if INCLUDE_DW_ONLY_COLUMNS:
+    in_scope = set(fields["TableName"].str.upper())
+    known = set(zip(fields["TableName"].str.upper(), fields["FieldName"].str.upper()))
+    dw_only = dw[dw["TableKey"].isin(in_scope)]
+    dw_only = dw_only[[(t, f) not in known for t, f in zip(dw_only["TableKey"], dw_only["FieldKey"])]]
+    dw_only = dw_only.assign(
+        TableName=dw_only["TableKey"], PK="", InExport="", Source="OperaCloud DW (not in model)",
+        ExcelOrder=range(len(fields), len(fields) + len(dw_only)),
+    )[["TableName", "FieldName", "PK", "InExport", "Source", "ExcelOrder"]]
+    fields = pd.concat([fields, dw_only], ignore_index=True)
+
+print(len(fields), "fields in total (expected 268 = 224 + 17 + 27)")
+
+# %% Cell 5 - Join data types and flag anything missing from the DW
+fields["TableKey"] = fields["TableName"].str.upper()
+fields["FieldKey"] = fields["FieldName"].str.upper()
+merged = fields.merge(
+    dw[["TableKey", "FieldKey", "SQLDataType", "IsNullable"]],
+    on=["TableKey", "FieldKey"], how="left",
+)
+merged["InDW"] = merged["SQLDataType"].notna().map({True: "Y", False: "N"})
+merged["SQLDataType"] = merged["SQLDataType"].fillna("")
+merged["IsNullable"] = merged["IsNullable"].fillna("")
+
+not_in_dw = merged[merged["InDW"] == "N"]
+print(len(not_in_dw), "fields not found in the OperaCloud DW:")
+not_in_dw[["TableName", "FieldName", "InExport"]]
+
+# %% Cell 6 - Descriptions (drafts based on standard OPERA naming; verify before sending)
+TABLE_DESCRIPTIONS = {
+    "ALLOTMENT_HEADER": "Business blocks / group allotments: one row per block (code, dates, status, linked company/agent).",
+    "AR_ACCOUNT": "Accounts receivable (direct bill) accounts.",
+    "FINANCIAL_TRANSACTIONS": "Folio transactions: every charge, payment and adjustment posted, by business date and transaction code.",
+    "FINANCIAL_TRANSACTIONS_JRNL": "Journal (audit history) of financial transactions.",
+    "MEMBERSHIPS": "Loyalty / membership cards attached to guest profiles.",
+    "NAME": "Profiles: guests, companies, travel agents, sources and groups.",
+    "NAME_ADDRESS": "Addresses linked to profiles.",
+    "NAME_PHONE": "Phone numbers and email addresses linked to profiles.",
+    "RATE_CODE_STAT_DAILY": "Daily statistics by rate code (rooms, guests, revenue).",
+    "REP_MANAGER": "Daily Manager's Report statistics: occupancy, room counts by type and revenue per business date.",
+    "RESERVATION_ACTION": "Reservation activity log: creations, changes, cancellations, check-ins and check-outs.",
+    "RESERVATION_DAILY_ELEMENT_NAME": "Per-night, per-guest reservation details.",
+    "RESERVATION_DAILY_ELEMENTS": "Per-night reservation details (room, guests).",
+    "RESERVATION_MEMBERSHIPS": "Memberships applied to reservations.",
+    "RESERVATION_NAME": "Reservation header per guest: confirmation number, status, arrival/departure, linked profile.",
+    "RESERVATION_STAT_DAILY": "Daily statistics per reservation per business date: room nights, arrivals/departures and room/F&B/total revenue.",
+    "RESERVATION_SUMMARY": "Summarized reservation statistics by date and room type.",
+    "RESORT_ROOM_CATEGORY": "Room type configuration.",
+    "ROOM": "Room master: room numbers, room types, housekeeping and front office status.",
+    "ROOM_FEATURE": "Features assigned to rooms.",
+    "STAY_RECORDS": "Guest stay history: one row per stay (arrival/departure, room, source, block).",
+    "TRX_CODES": "Transaction code configuration. Key to mapping postings to report lines.",
+}
+
+# Table-specific overrides where the same column name means different things
+TABLE_FIELD_DESCRIPTIONS = {
+    ("ALLOTMENT_HEADER", "BEGIN_DATE"): "Block start date",
+    ("ALLOTMENT_HEADER", "END_DATE"): "Block end date",
+    ("ALLOTMENT_HEADER", "OWNER"): "Block owner (sales user)",
+    ("RESERVATION_NAME", "BEGIN_DATE"): "Arrival date",
+    ("RESERVATION_NAME", "END_DATE"): "Departure date",
+    ("ROOM", "DESCRIPTION"): "Room description",
+    ("TRX_CODES", "DESCRIPTION"): "Transaction code description",
+    ("REP_MANAGER", "ROOM_REVENUE"): "Room revenue for the business date",
+    ("RESERVATION_SUMMARY", "ID"): "Primary key (formerly ROWID)",
+}
+
+FIELD_DESCRIPTIONS = {
+    # Keys / common
+    "PKID": "Primary key of the record",
+    "RESORT": "Property code",
+    "CHAIN_CODE": "Hotel chain code",
+    "NAME_ID": "Profile ID (links to NAME)",
+    "RESV_NAME_ID": "Reservation ID per guest (links to RESERVATION_NAME)",
+    "BUSINESS_DATE": "Opera business date (rolls at night audit, not midnight)",
+    "INSERT_DATE": "Record created date",
+    "INSERT_USER": "Record created by",
+    "UPDATE_DATE": "Record last updated date",
+    "UPDATE_USER": "Record last updated by",
+    "RNA_INSERTDATE": "Date loaded into the reporting extract",
+    "RNA_UPDATEDATE": "Date last updated in the reporting extract",
+    "JRN_FILERBA": "Replication journal metadata",
+    "JRN_FILESEQNO": "Replication journal metadata",
+    "JRN_FLAG": "Replication journal metadata",
+    "JRN_SCN": "Replication journal metadata",
+    "JRN_SLICING_TS": "Replication journal metadata",
+    "JRN_UPDATE_DTTM": "Replication journal metadata",
+    "DSI": "Source system indicator (confirm)",
+    "ORGANIZATIONID": "Organization ID",
+    "ORGANIZATION_ID": "Organization ID",
+    "MARKET_CODE": "Market segment code",
+    "SOURCE_CODE": "Source code",
+    "RATE_CODE": "Rate code",
+    "ROOM": "Room number",
+    "ROOM_CATEGORY": "Room type",
+    "ROOM_CLASS": "Room class",
+    "ZIP_CODE": "Postal code",
+    "MEMBERSHIP_ID": "Membership ID (links to MEMBERSHIPS)",
+    # AR_ACCOUNT
+    "ACCOUNT_CODE": "AR account code",
+    "ACCOUNT_NAME": "AR account name",
+    "ACCOUNT_NO": "AR account number",
+    "ACCOUNT_SNAME": "AR account short name",
+    # FINANCIAL_TRANSACTIONS
+    "BILL_NO": "Bill (folio print) number",
+    "FOLIO_NO": "Folio number",
+    "INVOICE_NO": "AR invoice number",
+    "NET_AMOUNT": "Net amount (excluding tax)",
+    "POSTED_AMOUNT": "Amount as posted",
+    "REFERENCE": "Posting reference text",
+    "ROOM_NTS": "Room nights",
+    "TRX_AMOUNT": "Transaction amount",
+    "TRX_CODE": "Transaction code (links to TRX_CODES)",
+    "TRX_DATE": "Transaction date",
+    "TRX_NO": "Transaction number",
+    # MEMBERSHIPS
+    "INACTIVE_DATE": "Date the membership became inactive",
+    "MEMBERSHIP_CARD_NO": "Membership card number",
+    "MEMBERSHIP_TYPE": "Membership program type",
+    "MEMBERSHIP_LEVEL": "Membership tier/level",
+    "NAME_ON_CARD": "Name printed on the membership card",
+    "ORDER_BY": "Display order",
+    # NAME / address / phone
+    "FIRST": "First name",
+    "LAST": "Last name / company name",
+    "MIDDLE": "Middle name",
+    "NAME_CODE": "Profile code",
+    "ADDRESS_ID": "Address ID (links to NAME_ADDRESS)",
+    "ADDRESS1": "Address line 1",
+    "ADDRESS2": "Address line 2",
+    "CITY": "City",
+    "STATE": "State",
+    "PHONE_ID": "Phone ID (links to NAME_PHONE)",
+    "PHONE_NUMBER": "Phone number or email",
+    "PHONE_TYPE": "Phone type (e.g. home, mobile, email)",
+    # RATE_CODE_STAT_DAILY
+    "FB_REF": "F&B reference",
+    "GROUP_NAME": "Group name",
+    "IN_GUEST": "In-house guests",
+    "NO_DEFINITE_ROOMS": "Definite rooms",
+    "OTHER_REV": "Other revenue",
+    "REVENUE": "Revenue",
+    # REP_MANAGER (Manager's Report)
+    "ARRIVAL_ROOM": "Arrival rooms",
+    "AVAIL_ROOM": "Available rooms",
+    "COMP_ROOM": "Complimentary rooms",
+    "DAYUSE_ROOM": "Day-use rooms",
+    "DEPARTURE_ROOM": "Departure rooms",
+    "FIT_ROOMS_TODAY": "FIT (individual) rooms",
+    "FOOD_BEV_REVENUE": "Food and beverage revenue",
+    "GROUP_ROOM": "Group rooms",
+    "GUEST_IN_HOUSE": "Guests in house",
+    "HOUSE_USE_ROOM": "House-use rooms",
+    "NOSHOW_ROOM": "No-show rooms",
+    "OCC_ROOM": "Occupied rooms",
+    "OOO_ROOMS": "Out-of-order rooms",
+    "PHYSICAL_ROOM": "Physical rooms (total inventory)",
+    "ROOM_REVENUE": "Room revenue",
+    # RESERVATION_ACTION
+    "ACTION_DESCRIPTION": "Description of the action",
+    "ACTION_INSTANCE_ID": "Action ID",
+    "ACTION_TYPE": "Action type (e.g. new, change, cancel, check-in)",
+    "CALL_HEADER_ID": "Call/inquiry ID",
+    "CONTEXT_CD": "Context code",
+    "CRO_CODE": "Central reservations office code",
+    "DELETED_FLAG": "Flag: record deleted",
+    "DEVICE_CODE": "Device code",
+    "GUID": "Global unique identifier",
+    "IP_ADDRESS": "IP address of the user",
+    "MACHINE": "Machine name",
+    "MODULE": "Opera module that made the change",
+    "PARENT_ACTION_INSTANCE_ID": "Parent action ID",
+    "ROOT_RESV_NAME_ID": "Original reservation ID",
+    "TERMINAL": "Terminal",
+    # Reservation daily / name
+    "RESV_DAILY_EL_SEQ": "Daily element sequence (links per-night rows)",
+    "ADULTS": "Number of adults",
+    "EXTERNAL_REFERENCE": "External reference number",
+    "CANCELLATION_DATE": "Cancellation date",
+    "CONFIRMATION_NO": "Reservation confirmation number",
+    "GUEST_FIRST_NAME": "Guest first name",
+    "GUEST_LAST_NAME": "Guest last name",
+    "RESV_STATUS": "Reservation status",
+    "SGUEST_NAME": "Guest display name",
+    "TRUNC_ACTUAL_CHECK_OUT_DATE": "Actual check-out date",
+    # RESERVATION_STAT_DAILY
+    "ARR_ROOMS": "Arrival rooms",
+    "CASH_ROOM_NTS": "Paid (non-comp) room nights",
+    "CASH_ROOM_REVENUE": "Paid (non-comp) room revenue",
+    "COMP_ROOM_NTS": "Complimentary room nights",
+    "COMP_ROOM_REVENUE": "Complimentary room revenue",
+    "DAY_USE_ROOMS": "Day-use rooms",
+    "DEP_ROOMS": "Departure rooms",
+    "FOOD_REVENUE": "Food and beverage revenue",
+    "GROUP_ID": "Group profile ID",
+    "NIGHTS": "Number of nights",
+    "NO_SHOW_ROOMS": "No-show rooms",
+    "RATE_CATEGORY": "Rate category",
+    "RESERVATION_DATE": "Stay date the row applies to",
+    "ROOM_RESV_STATUS": "Room reservation status",
+    "SOURCE_MAIN_GROUP": "Source main group",
+    "TOTAL_REVENUE": "Total revenue",
+    # RESERVATION_SUMMARY
+    "CONSIDERED_DATE": "Date the summary row applies to",
+    "EVENT_ID": "Event ID",
+    # RESORT_ROOM_CATEGORY
+    "LABEL": "Room type label",
+    "SHORT_DESCRIPTION": "Room type short description",
+    # ROOM
+    "ASSIGN_DATE": "Room assignment date",
+    "ASSIGN_REASON": "Room assignment reason",
+    "ASSIGN_STATUS": "Room assignment status",
+    "ASSIGN_TYPE": "Room assignment type",
+    "ASSIGN_UID": "User who assigned the room",
+    "COMMENTS": "Comments",
+    "CREDITS": "Housekeeping credits",
+    "CREDITS_TURNDOWN": "Turndown credits",
+    "FO_PERS": "Front office person count",
+    "FO_STATUS": "Front office status (vacant/occupied)",
+    "HK_EVENING_SECTION": "Housekeeping evening section",
+    "HK_INSP_FLAG": "Flag: room inspected",
+    "HK_PERS": "Housekeeping person count",
+    "HK_SECTION_CODE": "Housekeeping section code",
+    "HK_STATUS": "Housekeeping status",
+    "HOLD_DATE_TIME": "Room hold date/time",
+    "HOLD_USER": "User who placed the hold",
+    "LAST_CHECK_OUT_DATE": "Last check-out date",
+    "MAX_OCCUPANCY": "Maximum occupancy",
+    "OCCUPANT_DISCREPANCY": "Occupancy discrepancy flag",
+    "PERSON_DISCREPANCY": "Person count discrepancy flag",
+    "PSEUDO_YN": "Flag: pseudo room (e.g. PM/posting master)",
+    "ROOM_STATUS": "Room status (clean, dirty, inspected, OOO)",
+    "ROOM_USE_COUNT": "Room use count",
+    "SUITE_TYPE": "Suite type",
+    # ROOM_FEATURE / TRX_CODES
+    "FEATURE": "Room feature code",
+    "COMP_YN": "Flag: complimentary transaction code",
+    # ALLOTMENT_HEADER
+    "ALLOTMENT_HEADER_ID": "Block ID",
+    "ALLOTMENT_CODE": "Block code",
+    "MASTER_NAME_ID": "Master profile ID",
+    "COMPANY_NAME_ID": "Company profile ID",
+    "AGENT_NAME_ID": "Travel agent profile ID",
+    "BOOKING_STATUS": "Block status (e.g. tentative, definite)",
+    "BOOKING_ID": "Booking ID",
+    "GUARANTEE_CODE": "Guarantee code",
+    "CONTACT_NAME_ID": "Contact profile ID",
+    "CURRENCY_CODE": "Currency code",
+    # STAY_RECORDS
+    "STAY_RECORD_ID": "Stay record ID",
+    "PMS_RESV_NO": "PMS reservation number",
+    "RECORD_TYPE": "Stay record type (e.g. checked out, cancelled)",
+    "ARRIVAL_DATE": "Arrival date",
+    "DEPARTURE_DATE": "Departure date",
+    "BOOK_DATE": "Booking date",
+    "BOOKED_ARRIVAL_DATE": "Originally booked arrival date",
+    "BOOKED_DEPARTURE_DATE": "Originally booked departure date",
+    "CRS_BOOK_NO": "Central reservation number",
+    "ROOM_LABEL": "Room type label",
+    "ROOM_NUMBER": "Room number",
+    "GUEST_NAME_ID": "Guest profile ID",
+    "PMS_NAME_ID": "PMS profile ID",
+    "PMS_RESV_NAME_ID": "PMS reservation ID per guest",
+    "MEMBERSHIP_TRX_LINK_ID": "Membership transaction link ID",
+    "LOCAL_RESV_NAME_ID": "Local reservation ID",
+}
+
+
+def describe(row):
+    key = (row["TableKey"], row["FieldKey"])
+    if key in TABLE_FIELD_DESCRIPTIONS:
+        return TABLE_FIELD_DESCRIPTIONS[key]
+    return FIELD_DESCRIPTIONS.get(row["FieldKey"], "")
+
+
+merged["TableDescription"] = merged["TableKey"].map(TABLE_DESCRIPTIONS).fillna("")
+merged["FieldDescription"] = merged.apply(describe, axis=1)
+
+blank = merged[merged["FieldDescription"] == ""]
+print(len(blank), "fields still without a description")
+blank[["TableName", "FieldName"]]
+
+# %% Cell 7 - Final layout and preview
+final_df = (
+    merged.sort_values(["TableName", "ExcelOrder"])[
+        ["TableName", "TableDescription", "FieldName", "FieldDescription",
+         "PK", "InExport", "SQLDataType", "IsNullable", "InDW", "Source"]
+    ].reset_index(drop=True)
+)
+print(len(final_df), "rows")
+final_df.head(50)
+
+# %% Cell 8 - Export to CSV
+OUTPUT_FILE = "OperaCloud_Schema.csv"
+final_df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
+print("Exported", len(final_df), "rows to", OUTPUT_FILE)
